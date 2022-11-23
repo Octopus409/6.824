@@ -808,4 +808,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.applier()
 
 	return rf
+
+	// 这里加一句注释
 }
