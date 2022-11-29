@@ -1,9 +1,0 @@
-warning: only one CPU, which may conceal locking bugs
-Test (2A): initial election ...
-  ... Passed --   3.0  3   56   14410    0
-Test (2A): election after network failure ...
-  ... Passed --   4.4  3  122   23888    0
-Test (2A): multiple elections ...
-  ... Passed --   5.4  7  558  107880    0
-PASS
-ok  	6.824/raft	12.763s
