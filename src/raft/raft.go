@@ -226,6 +226,7 @@ type AppendEntriesArgs struct{
 type AppendEntriesReply struct{
 	Term int
 	Success bool  // true代表同步成功
+	IndexNear int  // 用于快速同步nextIndex
 }
 
 func (rf *Raft)isLogUpToDate(LastLogTerm int,LastLogIndex int) bool {
@@ -308,8 +309,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) isLogMatch(PreLogTerm int,PreLogIndex int) bool {
-	lastlog := len(rf.log)-1
-	if lastlog >= PreLogIndex && rf.log[PreLogIndex].Term == PreLogTerm{
+	lastLogIndex := len(rf.log)-1
+	if lastLogIndex >= PreLogIndex && rf.log[PreLogIndex].Term == PreLogTerm{
 		return true
 	}
 	return false
@@ -317,27 +318,40 @@ func (rf *Raft) isLogMatch(PreLogTerm int,PreLogIndex int) bool {
 
 func (rf *Raft) updateLog(PreLogIndex int,log []Log){
 	// 遵循不截断原则，除非出现不同，否则不截断后面的。
-	tmplog := rf.log[0:PreLogIndex+1]
+	
+	// 更新日志，rightLimit是超出原log长度的地方，需要用append，如果没超过rightLimit就简单赋值。
+	// 这样操作，符合截断原则
+	rightLimit := len(rf.log) - 1
 
-	/*
-	var isDiff bool
 	for i,l := range log {
-		if l.Term==rf.log[PreLogIndex+1+i]
-	}
-	*/
-	for _,l := range log {
-		tmplog = append(tmplog,l)
+		if (PreLogIndex + i + 1) > rightLimit {
+			rf.log = append(rf.log,l)
+		} else {
+			rf.log[PreLogIndex+i+1] = l
+		}
 	}
 
-	/*
-	if PreLogIndex + len(log) < len(rf.log) -1 {
-		// 补齐后面的
+}
 
+func (rf *Raft) findIndexOfThisTerm(PreLogIndex int) int {
+	NearTerm := -1     //日志中PreLogIndex之前的Term，不包括PreLogIndex所处的Term，因为它已经被比较过一次了。
+	res := -1
+	if PreLogIndex  > len(rf.log) - 1 {
+		NearTerm = rf.log[len(rf.log)-1].Term
+		res = len(rf.log)-1
+		for rf.log[res-1].Term == NearTerm {
+			res--
+		}
+	} else {
+		NearTerm = rf.log[PreLogIndex].Term
+		res = PreLogIndex
+		for rf.log[res-1].Term == NearTerm {
+			res--
+		}
 	}
-	*/
 
-	// 忽略历史报文，直接拼接试试
-	rf.log = tmplog
+	return res
+
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply) {
@@ -348,6 +362,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 		// 礼貌回复一下就行
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.IndexNear = -1
 	} else if args.Term == rf.currentTerm {
 		// 保持这个Term、重置选举时间
 		// Follower要保持Follower，Candidate要降级为Follower，Leader应该是不可能收到这个的
@@ -363,10 +378,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 			} 
 			reply.Term = rf.currentTerm
 			reply.Success = true
+			reply.IndexNear = -1
 		} else {
 			// 不匹配，返回false，等一下轮更新
 			reply.Term = rf.currentTerm
 			reply.Success = false
+			reply.IndexNear = rf.findIndexOfThisTerm(args.PreLogIndex)
 		}
 
 		if rf.currentState== Candidate{
@@ -387,9 +404,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 			} 
 			reply.Term = rf.currentTerm
 			reply.Success = true
+			reply.IndexNear = -1
 		} else {
 			reply.Term = rf.currentTerm
 			reply.Success = false
+			reply.IndexNear = rf.findIndexOfThisTerm(args.PreLogIndex)
 		}
 
 		DPrintf(" S%d Term update (from %d to %d)",rf.me,rf.currentTerm,args.Term)
@@ -636,11 +655,10 @@ func (rf *Raft) one_RequestVote(peer int,args *RequestVoteArgs,grantedVote *int)
 			rf.votedFor = -1
 
 			// 收到更新的Term，降为Follower，更新election_time
-			if rf.currentState==Candidate{
-				rf.currentState = Follower
-				DPrintf(" S%d State change Candidate -> Follower",rf.me)
-			}
+			rf.currentState = Follower
 			rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150)
+
+			DPrintf(" S%d State change Candidate -> Follower",rf.me)
 		}
 	}
 	// 只发送一次，发送失败就算了
@@ -680,8 +698,8 @@ func (rf *Raft) one_AppendEntries(peer int,args *AppendEntriesArgs,lastlog int){
 			}
 		} else {
 			if reply.Term == rf.currentTerm {
-				// 日志匹配失败，降低nextIndex
-				rf.nextIndex[peer]--
+				// 日志匹配失败，降低nextIndex至reply中提示的IndexNear
+				rf.nextIndex[peer] = reply.IndexNear
 			} else if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
@@ -746,7 +764,7 @@ func (rf *Raft)canIncreaseCommitIndex(index int)bool{
 }
 
 func get_rand_time(base int,ran int)int64{
-	// 20ms为一个间隔，不能靠太近
+	
 	if ran==0 {
 		return int64(base)
 	}

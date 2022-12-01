@@ -3,7 +3,7 @@ package raft
 import "log"
 
 // Debugging
-const Debug = true
+const Debug = false
 
 func initLog(){
 	log.SetFlags(log.Lmicroseconds)
