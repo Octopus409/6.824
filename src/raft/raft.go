@@ -18,11 +18,11 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"sync"
 	"sync/atomic"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 
 	// 其他一些包
@@ -143,6 +143,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -166,6 +174,24 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	var currentTerm int
+	var votedFor int
+	var log []Log
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) !=nil || 
+	    d.Decode(&log) != nil {
+	   DPrintf(" S%d readPersist error",rf.me)
+	   return
+	} else {
+	   rf.currentTerm = currentTerm
+	   rf.votedFor = votedFor
+	   rf.log = log
+	}
+	DPrintf(" S%d readPersist Term=%d, Log length is %d",rf.me,rf.currentTerm,len(rf.log))
 }
 
 
@@ -247,6 +273,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	DPrintf(" S%d RequestVote from S%d",rf.me,args.CandidateId)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -334,18 +361,18 @@ func (rf *Raft) updateLog(PreLogIndex int,log []Log){
 }
 
 func (rf *Raft) findIndexOfThisTerm(PreLogIndex int) int {
-	NearTerm := -1     //日志中PreLogIndex之前的Term，不包括PreLogIndex所处的Term，因为它已经被比较过一次了。
-	res := -1
+	NearTerm := -1     //日志中PreLogIndex之前的Term
+	res := 1
 	if PreLogIndex  > len(rf.log) - 1 {
 		NearTerm = rf.log[len(rf.log)-1].Term
-		res = len(rf.log)-1
-		for rf.log[res-1].Term == NearTerm {
+		res = len(rf.log)
+		for res>1 && rf.log[res-1].Term == NearTerm {
 			res--
 		}
 	} else {
 		NearTerm = rf.log[PreLogIndex].Term
 		res = PreLogIndex
-		for rf.log[res-1].Term == NearTerm {
+		for res>1 && rf.log[res-1].Term == NearTerm {
 			res--
 		}
 	}
@@ -357,6 +384,7 @@ func (rf *Raft) findIndexOfThisTerm(PreLogIndex int) int {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	DPrintf(" S%d AppendEntries from S%d",rf.me,args.LeaderId)
 	if args.Term < rf.currentTerm {
 		// 礼貌回复一下就行
@@ -371,8 +399,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 			// 匹配的话，要进行日志更新。
 			rf.updateLog(args.PreLogIndex,args.Entries)
 			if args.LeaderCommit > rf.commitIndex {
-				
-				rf.commitIndex = min(args.LeaderCommit,len(rf.log)-1)
+				// 注意：为防止历史RPC对commitIndex的影响，commitIndex只能增大不能变小
+				OldCommitIndex := rf.commitIndex
+				tmpCommitIndex := min(args.LeaderCommit,len(rf.log)-1)
+				rf.commitIndex = max(rf.commitIndex,tmpCommitIndex)
+				if OldCommitIndex < rf.commitIndex {
+					DPrintf(" S%d Commit Log (from %d to %d) from S%d",rf.me,OldCommitIndex,rf.commitIndex,args.LeaderId)
+				}
 				//fmt.Println("Im ",rf.me," LeaderCommit is ",args.LeaderCommit," .New CommitIndex is ",rf.commitIndex)
 				rf.applyCond.Signal()
 			} 
@@ -398,9 +431,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 		// ===================日志对比
 		if rf.isLogMatch(args.PreLogTerm,args.PreLogIndex) {
 			// 匹配的话，要进行日志更新。
+			//DPrintf("[调试] S%d Log match with S%d",rf.me,args.LeaderId)
 			rf.updateLog(args.PreLogIndex,args.Entries)
 			if args.LeaderCommit > rf.commitIndex {
-				rf.commitIndex = min(args.LeaderCommit,len(rf.log)-1)
+				OldCommitIndex := rf.commitIndex
+				tmpCommitIndex := min(args.LeaderCommit,len(rf.log)-1)
+				rf.commitIndex = max(rf.commitIndex,tmpCommitIndex)
+				if OldCommitIndex < rf.commitIndex {
+					DPrintf(" S%d Commit Log (from %d to %d) from S%d",rf.me,OldCommitIndex,rf.commitIndex,args.LeaderId)
+				}
+				//DPrintf("[调试][argsTerm大于currentTerm] S%d update commitIndex (from %d to %d) because %d, and lastapplied is %d",rf.me,OldCommitIndex,rf.commitIndex,args.LeaderId,rf.lastApplied)
+				rf.applyCond.Signal()
 			} 
 			reply.Term = rf.currentTerm
 			reply.Success = true
@@ -414,15 +455,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 		DPrintf(" S%d Term update (from %d to %d)",rf.me,rf.currentTerm,args.Term)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		if rf.currentState==Leader || rf.currentState==Candidate{
-			switch rf.currentState{
-			case Leader:
-				DPrintf(" S%d State change Leader -> Follower",rf.me)
-			case Candidate:
-				DPrintf(" S%d State change Candidate -> Follower",rf.me)
-			}
-			rf.currentState = Follower
+		
+		if rf.currentState == Leader {
+			DPrintf(" S%d State change Leader -> Follower",rf.me)
+		} else if rf.currentState == Candidate {
+			DPrintf(" S%d State change Candidate -> Follower",rf.me)
 		}
+		rf.currentState = Follower
 		rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150)
 	}
 }
@@ -501,6 +540,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	if rf.currentState!=Leader {
 		return -1,-1,false
 	}
@@ -591,6 +631,9 @@ func (rf *Raft) genAppendEntriesArgs(peer int)*AppendEntriesArgs{
 		}
 	}
 	res.PreLogIndex = rf.nextIndex[peer]-1
+	if res.PreLogIndex == -1 {
+		DPrintf("[调试][error] S%d currentTerm=%d,Log length is %d,nextIndex for S%d is %d",rf.me,rf.currentTerm,len(rf.log),peer,rf.nextIndex[peer])
+	}
 	res.PreLogTerm = rf.log[rf.nextIndex[peer]-1].Term
 
 	res.LeaderCommit = rf.commitIndex
@@ -609,10 +652,11 @@ func (rf *Raft) begin_eletion(){
 
 	// 使用协程发动选举
 	// 需要对candidate当前状态进行一个快照，也就是requestVote的args要保存
-	args := rf.genRequestVoteArgs()
-
 	grantedVote := 1
 	rf.votedFor = rf.me
+	args := rf.genRequestVoteArgs()
+	rf.persist()
+
 	for peer := range rf.peers {
 		if peer==rf.me {
 			continue
@@ -631,6 +675,7 @@ func (rf *Raft) one_RequestVote(peer int,args *RequestVoteArgs,grantedVote *int)
 			// 成为Leader或者竞选失败后，后续发送已没有意义。
 			return
 		}
+		defer rf.persist()
 		if response.VoteGranted {
 			// 对面投票了，说明他的Term小于等于我的
 			*grantedVote++
@@ -686,25 +731,42 @@ func (rf *Raft) one_AppendEntries(peer int,args *AppendEntriesArgs,lastlog int){
 	if rf.sendAppendEntries(peer,args,&reply) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		if rf.currentState!=Leader {
+			// server已经不是leader，直接跳出
+			return
+		}
+		defer rf.persist()
 		if reply.Success == true {
 			// 同步成功
-			rf.nextIndex[peer] = lastlog+1
-			rf.matcnIndex[peer] = lastlog
+			// 写成这样是为了考虑历史RPC的影响，导致matchIndex出现倒退的问题。
+			if rf.nextIndex[peer] < lastlog + 1 {
+				rf.nextIndex[peer] = lastlog+1
+			}
+			if rf.matcnIndex[peer] < lastlog {
+				rf.matcnIndex[peer] = lastlog
+			}
 			// 检查commitIndex能否更新
-			if lastlog > rf.commitIndex && rf.canIncreaseCommitIndex(lastlog){
+
+			// 这里要判断是否是当前Term的log，否则不予commit
+			if (rf.log[lastlog].Term == rf.currentTerm) && (lastlog > rf.commitIndex) && rf.canIncreaseCommitIndex(lastlog){
 				//fmt.Println("increasing the commitIndex")
+				OldCommitIndex := rf.commitIndex
 				rf.commitIndex = lastlog
+				DPrintf(" S%d Commit Log (from %d to %d) Last approved from S%d",rf.me,OldCommitIndex,rf.commitIndex,peer)
 				rf.applyCond.Signal()
 			}
 		} else {
 			if reply.Term == rf.currentTerm {
 				// 日志匹配失败，降低nextIndex至reply中提示的IndexNear
 				rf.nextIndex[peer] = reply.IndexNear
+				//rf.nextIndex[peer]--
 			} else if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
 				rf.currentState = Follower
 				rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150)
+
+				DPrintf(" S%d State change Leader -> Follower",rf.me)
 			}
 		}
 	}
