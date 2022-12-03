@@ -1,5 +1,3 @@
-#运行500次2B，并统计成功次数。
-
 #!/bin/bash
 #
 # Script for running `go test` a bunch of times, in parallel, storing the test

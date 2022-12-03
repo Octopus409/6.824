@@ -346,18 +346,25 @@ func (rf *Raft) isLogMatch(PreLogTerm int,PreLogIndex int) bool {
 func (rf *Raft) updateLog(PreLogIndex int,log []Log){
 	// 遵循不截断原则，除非出现不同，否则不截断后面的。
 	
-	// 更新日志，rightLimit是超出原log长度的地方，需要用append，如果没超过rightLimit就简单赋值。
+	// 更新日志，rightLimit是原log最大的下标，超过其就需要用append，如果没超过rightLimit就简单赋值。
+	// 此外，还要判断是否存在日志 log[i].Term != rf.log[i].Term ，存在则代表，i后面所有日志都是错误的，需要丢弃。
 	// 这样操作，符合截断原则
 	rightLimit := len(rf.log) - 1
-
+	isDif := false
 	for i,l := range log {
 		if (PreLogIndex + i + 1) > rightLimit {
 			rf.log = append(rf.log,l)
 		} else {
+			if isDif == false && rf.log[PreLogIndex+i+1].Term != l.Term {
+				// 有不同的日志，需要截断PreLogIndex + len(log) 后面的所有日志
+				isDif = true
+			}
 			rf.log[PreLogIndex+i+1] = l
 		}
 	}
-
+	if isDif==true && rightLimit > (PreLogIndex + len(log)) {
+		rf.log = rf.log[:PreLogIndex+len(log)+1]
+	}
 }
 
 func (rf *Raft) findIndexOfThisTerm(PreLogIndex int) int {
