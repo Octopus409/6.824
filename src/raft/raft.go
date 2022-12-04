@@ -27,10 +27,67 @@ import (
 
 	// 其他一些包
 	"time"
-	//"fmt"
+	"fmt"
 	"math/rand"
+	"os"
+	"log"
+	"strconv"
 )
 
+
+// 下面是一些Pretty Debug的定义
+func getVerbosity() int {
+	v := os.Getenv("VERBOSE")
+	level := 0
+	if v != "" {
+		var err error
+		level, err = strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("Invalid verbosity %v", v)
+		}
+	}
+	return level
+}
+
+type logTopic string
+const (
+	dClient  logTopic = "CLNT"
+	dCommit  logTopic = "CMIT"
+	dDrop    logTopic = "DROP"
+	dError   logTopic = "ERRO"
+	dInfo    logTopic = "INFO"
+	dLeader  logTopic = "LEAD"
+	dLog     logTopic = "LOG1"
+	dLog2    logTopic = "LOG2"
+	dPersist logTopic = "PERS"
+	dSnap    logTopic = "SNAP"
+	dTerm    logTopic = "TERM"
+	dTest    logTopic = "TEST"
+	dTimer   logTopic = "TIMR"
+	dTrace   logTopic = "TRCE"
+	dVote    logTopic = "VOTE"
+	dWarn    logTopic = "WARN"
+)
+
+var debugStart time.Time
+var debugVerbosity int
+
+func Init() {
+	debugVerbosity = getVerbosity()
+	debugStart = time.Now()
+
+	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+}
+
+func Debug(topic logTopic, format string, a ...interface{}) {
+	if debug == true {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -151,6 +208,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+
+	//Debug(dPersist,"S%d Saved State T:%d VF:%d N:%d",rf.me,rf.currentTerm,rf.votedFor,len(rf.log))
 }
 
 
@@ -158,7 +217,10 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		Debug(dPersist,"S%d Starting T:%d VF:%d N:%d",rf.me,rf.currentTerm,rf.votedFor,len(rf.log))
 		return
 	}
 	// Your code here (2C).
@@ -184,14 +246,14 @@ func (rf *Raft) readPersist(data []byte) {
 	var log []Log
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) !=nil || 
 	    d.Decode(&log) != nil {
-	   DPrintf(" S%d readPersist error",rf.me)
+		Debug(dError,"S%d readPersist error",rf.me)
 	   return
 	} else {
 	   rf.currentTerm = currentTerm
 	   rf.votedFor = votedFor
 	   rf.log = log
 	}
-	DPrintf(" S%d readPersist Term=%d, Log length is %d",rf.me,rf.currentTerm,len(rf.log))
+	Debug(dPersist,"S%d Starting T:%d VF:%d N:%d",rf.me,rf.currentTerm,rf.votedFor,len(rf.log))
 }
 
 
@@ -274,7 +336,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	DPrintf(" S%d RequestVote from S%d",rf.me,args.CandidateId)
+	//Debug(dVote,"S%d RequestVote from S%d",rf.me,args.CandidateId)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -293,6 +355,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.votedFor = args.CandidateId
 				rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150) 
 				reply.VoteGranted = true;
+				Debug(dVote,"S%d Granting Vote to S%d at T%d",rf.me,args.CandidateId,rf.currentTerm)
 			} else {
 				reply.VoteGranted = false;
 			}
@@ -307,17 +370,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 转为Follower
 		// 判断日志，返回True或false
 
-		DPrintf(" S%d Term update (from %d to %d)",rf.me,rf.currentTerm,args.Term)
+		Debug(dTerm,"S%d Term update T%d -> T%d",rf.me,rf.currentTerm,args.Term)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		if rf.currentState==Leader || rf.currentState==Candidate{
+			rf.currentState = Follower
 			switch rf.currentState{
 			case Leader:
-				DPrintf(" S%d State change Leader -> Follower",rf.me)
+				Debug(dInfo,"S%d Leader -> Follower at T%d",rf.me,rf.currentTerm)
 			case Candidate:
-				DPrintf(" S%d State change Candidate -> Follower",rf.me)
+				Debug(dInfo,"S%d Candidate -> Follower at T%d",rf.me,rf.currentTerm)
 			}
-			rf.currentState = Follower
 		}
 		rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150)
 
@@ -326,6 +389,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
+			Debug(dVote,"S%d Granting Vote to S%d at T%d",rf.me,args.CandidateId,rf.currentTerm)
 		} else {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
@@ -343,9 +407,12 @@ func (rf *Raft) isLogMatch(PreLogTerm int,PreLogIndex int) bool {
 	return false
 }
 
-func (rf *Raft) updateLog(PreLogIndex int,log []Log){
+func (rf *Raft) updateLog(PreLogIndex int,log []Log,leader int){
+	DeletedNum := 0
+	ModifiedNum := 0
+	AddNum := 0
+
 	// 遵循不截断原则，除非出现不同，否则不截断后面的。
-	
 	// 更新日志，rightLimit是原log最大的下标，超过其就需要用append，如果没超过rightLimit就简单赋值。
 	// 此外，还要判断是否存在日志 log[i].Term != rf.log[i].Term ，存在则代表，i后面所有日志都是错误的，需要丢弃。
 	// 这样操作，符合截断原则
@@ -354,16 +421,24 @@ func (rf *Raft) updateLog(PreLogIndex int,log []Log){
 	for i,l := range log {
 		if (PreLogIndex + i + 1) > rightLimit {
 			rf.log = append(rf.log,l)
+			AddNum++
 		} else {
-			if isDif == false && rf.log[PreLogIndex+i+1].Term != l.Term {
+			if rf.log[PreLogIndex+i+1].Term != l.Term {
 				// 有不同的日志，需要截断PreLogIndex + len(log) 后面的所有日志
 				isDif = true
+				ModifiedNum++
 			}
 			rf.log[PreLogIndex+i+1] = l
 		}
 	}
 	if isDif==true && rightLimit > (PreLogIndex + len(log)) {
 		rf.log = rf.log[:PreLogIndex+len(log)+1]
+		DeletedNum = rightLimit - (PreLogIndex + len(log))
+	}
+
+	if AddNum>0 || ModifiedNum>0 || DeletedNum>0 {
+		// 只有日志发生变化，才打印Log2
+		Debug(dLog2,"S%d <- S%d Log Write Add:%d Mod:%d Del:%d",rf.me,leader,AddNum,ModifiedNum,DeletedNum)
 	}
 }
 
@@ -392,7 +467,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	DPrintf(" S%d AppendEntries from S%d",rf.me,args.LeaderId)
+	//DPrintf(" S%d AppendEntries from S%d",rf.me,args.LeaderId)
 	if args.Term < rf.currentTerm {
 		// 礼貌回复一下就行
 		reply.Term = rf.currentTerm
@@ -404,14 +479,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 		// ===================日志对比
 		if rf.isLogMatch(args.PreLogTerm,args.PreLogIndex) {
 			// 匹配的话，要进行日志更新。
-			rf.updateLog(args.PreLogIndex,args.Entries)
+			rf.updateLog(args.PreLogIndex,args.Entries,args.LeaderId)
 			if args.LeaderCommit > rf.commitIndex {
 				// 注意：为防止历史RPC对commitIndex的影响，commitIndex只能增大不能变小
 				OldCommitIndex := rf.commitIndex
 				tmpCommitIndex := min(args.LeaderCommit,len(rf.log)-1)
 				rf.commitIndex = max(rf.commitIndex,tmpCommitIndex)
 				if OldCommitIndex < rf.commitIndex {
-					DPrintf(" S%d Commit Log (from %d to %d) from S%d",rf.me,OldCommitIndex,rf.commitIndex,args.LeaderId)
+					Debug(dCommit,"S%d Commit Log %d to %d at T%d",rf.me,OldCommitIndex,rf.commitIndex,rf.currentTerm)
 				}
 				//fmt.Println("Im ",rf.me," LeaderCommit is ",args.LeaderCommit," .New CommitIndex is ",rf.commitIndex)
 				rf.applyCond.Signal()
@@ -428,7 +503,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 
 		if rf.currentState== Candidate{
 			rf.currentState = Follower
-			DPrintf(" S%d State change Canditate -> Follower",rf.me)
+			Debug(dInfo,"S%d Canditate -> Follower at T%d",rf.me,rf.currentTerm)
 		}
 		rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150)
 	} else if args.Term > rf.currentTerm {
@@ -439,13 +514,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 		if rf.isLogMatch(args.PreLogTerm,args.PreLogIndex) {
 			// 匹配的话，要进行日志更新。
 			//DPrintf("[调试] S%d Log match with S%d",rf.me,args.LeaderId)
-			rf.updateLog(args.PreLogIndex,args.Entries)
+			rf.updateLog(args.PreLogIndex,args.Entries,args.LeaderId)
 			if args.LeaderCommit > rf.commitIndex {
 				OldCommitIndex := rf.commitIndex
 				tmpCommitIndex := min(args.LeaderCommit,len(rf.log)-1)
 				rf.commitIndex = max(rf.commitIndex,tmpCommitIndex)
 				if OldCommitIndex < rf.commitIndex {
-					DPrintf(" S%d Commit Log (from %d to %d) from S%d",rf.me,OldCommitIndex,rf.commitIndex,args.LeaderId)
+					Debug(dCommit,"S%d Commit Log %d to %d at T%d",rf.me,OldCommitIndex,rf.commitIndex,rf.currentTerm)
 				}
 				//DPrintf("[调试][argsTerm大于currentTerm] S%d update commitIndex (from %d to %d) because %d, and lastapplied is %d",rf.me,OldCommitIndex,rf.commitIndex,args.LeaderId,rf.lastApplied)
 				rf.applyCond.Signal()
@@ -459,14 +534,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs,reply* AppendEntriesReply)
 			reply.IndexNear = rf.findIndexOfThisTerm(args.PreLogIndex)
 		}
 
-		DPrintf(" S%d Term update (from %d to %d)",rf.me,rf.currentTerm,args.Term)
+		Debug(dTerm,"S%d Term update T%d -> T%d",rf.me,rf.currentTerm,args.Term)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		
 		if rf.currentState == Leader {
-			DPrintf(" S%d State change Leader -> Follower",rf.me)
+			Debug(dInfo,"S%d Leader -> Follower at T%d",rf.me,rf.currentTerm)
 		} else if rf.currentState == Candidate {
-			DPrintf(" S%d State change Candidate -> Follower",rf.me)
+			Debug(dInfo,"S%d Canditate -> Follower at T%d",rf.me,rf.currentTerm)
 		}
 		rf.currentState = Follower
 		rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150)
@@ -638,9 +713,6 @@ func (rf *Raft) genAppendEntriesArgs(peer int)*AppendEntriesArgs{
 		}
 	}
 	res.PreLogIndex = rf.nextIndex[peer]-1
-	if res.PreLogIndex == -1 {
-		DPrintf("[调试][error] S%d currentTerm=%d,Log length is %d,nextIndex for S%d is %d",rf.me,rf.currentTerm,len(rf.log),peer,rf.nextIndex[peer])
-	}
 	res.PreLogTerm = rf.log[rf.nextIndex[peer]-1].Term
 
 	res.LeaderCommit = rf.commitIndex
@@ -654,8 +726,9 @@ func (rf *Raft) begin_eletion(){
 	rf.currentTerm++   // 增加term
 	rf.election_timeout += get_rand_time(300,150) // 选举时间增加300多ms
 
-	DPrintf(" S%d begin_election",rf.me)
-	DPrintf(" S%d Term update (from %d to %d)",rf.me,rf.currentTerm-1,rf.currentTerm)
+	Debug(dTimer,"S%d Begin Election",rf.me)
+	Debug(dInfo,"S%d Follower -> Candidate",rf.me)
+	Debug(dTerm,"S%d Term update T%d -> T%d",rf.me,rf.currentTerm-1,rf.currentTerm)
 
 	// 使用协程发动选举
 	// 需要对candidate当前状态进行一个快照，也就是requestVote的args要保存
@@ -664,21 +737,23 @@ func (rf *Raft) begin_eletion(){
 	args := rf.genRequestVoteArgs()
 	rf.persist()
 
+	validTerm := rf.currentTerm
 	for peer := range rf.peers {
 		if peer==rf.me {
 			continue
 		}
-		go rf.one_RequestVote(peer,args,&grantedVote)
+		go rf.one_RequestVote(peer,args,&grantedVote,validTerm)
 	}
 }
 
-func (rf *Raft) one_RequestVote(peer int,args *RequestVoteArgs,grantedVote *int){
+func (rf *Raft) one_RequestVote(peer int,args *RequestVoteArgs,grantedVote *int,validTerm int){
 	// 创建发送args和reply的数组
 	response := RequestVoteReply{}
 	if rf.sendRequestVote(peer,args,&response) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		if rf.currentState!=Candidate {
+		if rf.currentTerm!=validTerm || rf.currentState!=Candidate {
+			// 如果不是合法的ValidTerm，跳过后续操作
 			// 成为Leader或者竞选失败后，后续发送已没有意义。
 			return
 		}
@@ -686,6 +761,7 @@ func (rf *Raft) one_RequestVote(peer int,args *RequestVoteArgs,grantedVote *int)
 		if response.VoteGranted {
 			// 对面投票了，说明他的Term小于等于我的
 			*grantedVote++
+			Debug(dVote,"S%d Got Vote <- S%d", rf.me,peer)
 			if *grantedVote > len(rf.peers)/2 {
 				rf.currentState = Leader
 				// 成为leader，不需要管election_timeout，这个等下一次变为follower时再更新
@@ -698,11 +774,10 @@ func (rf *Raft) one_RequestVote(peer int,args *RequestVoteArgs,grantedVote *int)
 
 				// 开启发送心跳报文
 				rf.heartsbeats_timeout = time.Now().UnixMilli()
-
-				DPrintf(" S%d State change Candidate -> Leader",rf.me)
+				Debug(dLeader, "S%d Achieved Majority for T%d , converting to Leader", rf.me,rf.currentTerm)
 			}
 		} else if response.Term > rf.currentTerm {
-			DPrintf(" S%d Term update (from %d to %d)",rf.me,rf.currentTerm,response.Term)
+			Debug(dTerm,"S%d Term update T%d -> T%d",rf.me,rf.currentTerm,response.Term)
 			rf.currentTerm = response.Term
 			rf.votedFor = -1
 
@@ -710,7 +785,7 @@ func (rf *Raft) one_RequestVote(peer int,args *RequestVoteArgs,grantedVote *int)
 			rf.currentState = Follower
 			rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150)
 
-			DPrintf(" S%d State change Candidate -> Follower",rf.me)
+			Debug(dInfo,"S%d Candidate -> Follower at T%d",rf.me,rf.currentTerm)
 		}
 	}
 	// 只发送一次，发送失败就算了
@@ -720,26 +795,29 @@ func (rf *Raft) one_RequestVote(peer int,args *RequestVoteArgs,grantedVote *int)
 func (rf *Raft) begin_heartsbeats(){
 
 	rf.heartsbeats_timeout += get_rand_time(100,0)
-	DPrintf(" S%d begin_heartsbeats",rf.me)
+	Debug(dTimer,"S%d Begin heartsbeats",rf.me)
 
 	lastlog := len(rf.log)-1
+	validTerm := rf.currentTerm
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
 		args := rf.genAppendEntriesArgs(peer)
-		go rf.one_AppendEntries(peer,args,lastlog)
+		go rf.one_AppendEntries(peer,args,lastlog,validTerm)
 	}
 
 }
 
-func (rf *Raft) one_AppendEntries(peer int,args *AppendEntriesArgs,lastlog int){
+func (rf *Raft) one_AppendEntries(peer int,args *AppendEntriesArgs,lastlog int,validTerm int){
 	reply := AppendEntriesReply{}
+	Debug(dLog,"S%d -> S%d Sending PLI:%d PLT:%d N:%d LC:%d",rf.me,peer,args.PreLogIndex,args.PreLogTerm,len(args.Entries),args.LeaderCommit)
 	if rf.sendAppendEntries(peer,args,&reply) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		if rf.currentState!=Leader {
+		if validTerm!=rf.currentTerm || rf.currentState!=Leader {
 			// server已经不是leader，直接跳出
+			// 或者并非validTerm，是历史RPC的reply可以直接退出。
 			return
 		}
 		defer rf.persist()
@@ -752,6 +830,8 @@ func (rf *Raft) one_AppendEntries(peer int,args *AppendEntriesArgs,lastlog int){
 			if rf.matcnIndex[peer] < lastlog {
 				rf.matcnIndex[peer] = lastlog
 			}
+			Debug(dLog,"S%d <- S%d OK Append NI[%d]=%d, MI[%d]=%d",rf.me,peer,peer,rf.nextIndex[peer],peer,rf.matcnIndex[peer])
+
 			// 检查commitIndex能否更新
 
 			// 这里要判断是否是当前Term的log，否则不予commit
@@ -759,21 +839,23 @@ func (rf *Raft) one_AppendEntries(peer int,args *AppendEntriesArgs,lastlog int){
 				//fmt.Println("increasing the commitIndex")
 				OldCommitIndex := rf.commitIndex
 				rf.commitIndex = lastlog
-				DPrintf(" S%d Commit Log (from %d to %d) Last approved from S%d",rf.me,OldCommitIndex,rf.commitIndex,peer)
+				Debug(dCommit,"S%d Commit Log %d to %d at T%d",rf.me,OldCommitIndex,rf.commitIndex,rf.currentTerm)
 				rf.applyCond.Signal()
 			}
 		} else {
 			if reply.Term == rf.currentTerm {
 				// 日志匹配失败，降低nextIndex至reply中提示的IndexNear
 				rf.nextIndex[peer] = reply.IndexNear
+				Debug(dLog,"S%d <- S%d Not match Append NI[%d]=%d",rf.me,peer,peer,rf.nextIndex[peer])
 				//rf.nextIndex[peer]--
 			} else if reply.Term > rf.currentTerm {
+				OldTerm := rf.currentTerm
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
 				rf.currentState = Follower
 				rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300,150)
-
-				DPrintf(" S%d State change Leader -> Follower",rf.me)
+				Debug(dTerm,"S%d Term update T%d -> T%d",rf.me,OldTerm,rf.currentTerm)
+				Debug(dInfo,"S%d Leader -> Follower at T%d",rf.me,rf.currentTerm)
 			}
 		}
 	}
@@ -810,7 +892,7 @@ func (rf *Raft)applier(){
 		// use Max(rf.lastApplied, commitIndex) rather than commitIndex directly to avoid concurrently InstallSnapshot rpc causing lastApplied to rollback
 		
 		rf.lastApplied = max(rf.lastApplied, commitIndex)
-		DPrintf(" S%d applied (from %d to %d)",rf.me,lastApplied,commitIndex)
+		Debug(dCommit,"S%d Applied Log %d to %d",rf.me,lastApplied,commitIndex)
 		rf.mu.Unlock()
 	}
 }
@@ -884,7 +966,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = append(rf.log,empty_log)
 
 	// 初始化调试的日志
-	initLog()
+	Init()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
