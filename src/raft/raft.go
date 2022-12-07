@@ -313,8 +313,12 @@ type AppendEntriesReply struct {
 	IndexNear int  // 用于快速同步nextIndex
 }
 
-func (rf *Raft) getFirstLogIndex() int {
-	return rf.log[0].LogIndex
+func (rf *Raft) getFirstLog() Log {
+	return rf.log[0]
+}
+
+func (rf *Raft) getLastLog() Log {
+	return rf.log[len(rf.log)-1]
 }
 
 func (rf *Raft) resetElectionTime() {
@@ -336,8 +340,8 @@ func (rf *Raft) increaseTerm(NewTerm int) {
 }
 
 func (rf *Raft) isLogUpToDate(LastLogTerm int, LastLogIndex int) bool {
-	myLastLogIndex := len(rf.log) - 1
-	myLastLogTerm := rf.log[len(rf.log)-1].Term
+	myLastLogIndex := rf.getLastLog().LogIndex
+	myLastLogTerm := rf.getLastLog().Term
 	if LastLogTerm > myLastLogTerm {
 		return true
 	} else if LastLogTerm == myLastLogTerm && LastLogIndex >= myLastLogIndex {
@@ -404,8 +408,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) isLogMatch(PreLogTerm int, PreLogIndex int) bool {
-	lastLogIndex := len(rf.log) - 1
-	if lastLogIndex >= PreLogIndex && rf.log[PreLogIndex].Term == PreLogTerm {
+	lastLogIndex := rf.getLastLog().LogIndex
+	firstlog := rf.getFirstLog().LogIndex
+	if lastLogIndex >= PreLogIndex && PreLogIndex >= firstlog && rf.log[PreLogIndex-firstlog].Term == PreLogTerm {
 		return true
 	}
 	return false
@@ -420,23 +425,24 @@ func (rf *Raft) updateLog(PreLogIndex int, log []Log, leader int) {
 	// 更新日志，rightLimit是原log最大的下标，超过其就需要用append，如果没超过rightLimit就简单赋值。
 	// 此外，还要判断是否存在日志 log[i].Term != rf.log[i].Term ，存在则代表，i后面所有日志都是错误的，需要丢弃。
 	// 这样操作，符合截断原则
-	rightLimit := len(rf.log) - 1
+	firstlog := rf.getFirstLog().LogIndex
+	rightLimit := rf.getLastLog().LogIndex
 	isDif := false
 	for i, l := range log {
 		if (PreLogIndex + i + 1) > rightLimit {
 			rf.log = append(rf.log, l)
 			AddNum++
 		} else {
-			if rf.log[PreLogIndex+i+1].Term != l.Term {
+			if rf.log[PreLogIndex+i+1-firstlog].Term != l.Term {
 				// 有不同的日志，需要截断PreLogIndex + len(log) 后面的所有日志
 				isDif = true
 				ModifiedNum++
 			}
-			rf.log[PreLogIndex+i+1] = l
+			rf.log[PreLogIndex+i+1-firstlog] = l
 		}
 	}
 	if isDif && rightLimit > (PreLogIndex+len(log)) {
-		rf.log = rf.log[:PreLogIndex+len(log)+1]
+		rf.log = rf.log[:PreLogIndex+len(log)-firstlog+1]
 		DeletedNum = rightLimit - (PreLogIndex + len(log))
 	}
 
@@ -446,19 +452,24 @@ func (rf *Raft) updateLog(PreLogIndex int, log []Log, leader int) {
 	}
 }
 
+// 返回PreLogIndex之前（包括PreLogIndex)的某一段Term内的首个日志的index
+// 注意判断snapshot的部分
 func (rf *Raft) findIndexOfThisTerm(PreLogIndex int) int {
 	NearTerm := -1 //日志中PreLogIndex之前的Term
 	res := 1
-	if PreLogIndex > len(rf.log)-1 {
+	lastlog := rf.getLastLog().LogIndex
+	firstlog := rf.getFirstLog().LogIndex
+	if PreLogIndex > lastlog {
 		NearTerm = rf.log[len(rf.log)-1].Term
-		res = len(rf.log)
-		for res > 1 && rf.log[res-1].Term == NearTerm {
+		res = lastlog + 1
+		// res最小取值是 firstlog + 1
+		for res > firstlog+1 && rf.log[res-firstlog-1].Term == NearTerm {
 			res--
 		}
 	} else {
-		NearTerm = rf.log[PreLogIndex].Term
+		NearTerm = rf.log[PreLogIndex-firstlog].Term
 		res = PreLogIndex
-		for res > 1 && rf.log[res-1].Term == NearTerm {
+		for res > firstlog+1 && rf.log[res-firstlog-1].Term == NearTerm {
 			res--
 		}
 	}
@@ -489,12 +500,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.LeaderCommit > rf.commitIndex {
 				// 注意：为防止历史RPC对commitIndex的影响，commitIndex只能增大不能变小
 				OldCommitIndex := rf.commitIndex
-				tmpCommitIndex := min(args.LeaderCommit, len(rf.log)-1)
+				tmpCommitIndex := min(args.LeaderCommit, rf.getLastLog().LogIndex)
 				rf.commitIndex = max(rf.commitIndex, tmpCommitIndex)
 				if OldCommitIndex < rf.commitIndex {
 					Debug(dCommit, "S%d Commit Log %d to %d at T%d", rf.me, OldCommitIndex, rf.commitIndex, rf.currentTerm)
 				}
-				//fmt.Println("Im ",rf.me," LeaderCommit is ",args.LeaderCommit," .New CommitIndex is ",rf.commitIndex)
 				rf.applyCond.Signal()
 			}
 			reply.Term = rf.currentTerm
@@ -528,7 +538,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.updateLog(args.PreLogIndex, args.Entries, args.LeaderId)
 			if args.LeaderCommit > rf.commitIndex {
 				OldCommitIndex := rf.commitIndex
-				tmpCommitIndex := min(args.LeaderCommit, len(rf.log)-1)
+				tmpCommitIndex := min(args.LeaderCommit, rf.getLastLog().LogIndex)
 				rf.commitIndex = max(rf.commitIndex, tmpCommitIndex)
 				if OldCommitIndex < rf.commitIndex {
 					Debug(dCommit, "S%d Commit Log %d to %d at T%d", rf.me, OldCommitIndex, rf.commitIndex, rf.currentTerm)
@@ -629,7 +639,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	logEntry := Log{
 		Term:     rf.currentTerm,
 		Command:  command,
-		LogIndex: index + 1,
+		LogIndex: index,
 	}
 	rf.log = append(rf.log, logEntry)
 
@@ -694,8 +704,8 @@ func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
 	res := RequestVoteArgs{}
 	res.Term = rf.currentTerm
 	res.CandidateId = rf.me
-	res.LastLogIndex = len(rf.log) - 1
-	res.LastLogTerm = rf.log[len(rf.log)-1].Term
+	res.LastLogIndex = rf.getLastLog().LogIndex
+	res.LastLogTerm = rf.getLastLog().Term
 	return &res
 }
 
@@ -705,14 +715,16 @@ func (rf *Raft) genAppendEntriesArgs(peer int) *AppendEntriesArgs {
 	res.Term = rf.currentTerm
 	res.LeaderId = rf.me
 	// Log[]、PreLogIndex、PreLogTerm关联于不同发送对象
-	if (len(rf.log) - 1) >= rf.nextIndex[peer] {
+	lastlog := rf.getLastLog().LogIndex
+	firstlog := rf.getFirstLog().LogIndex
+	if lastlog >= rf.nextIndex[peer] {
 		// 有log要发送
-		for i := rf.nextIndex[peer]; i < len(rf.log); i++ {
-			res.Entries = append(res.Entries, rf.log[i])
+		for i := rf.nextIndex[peer]; i <= lastlog; i++ {
+			res.Entries = append(res.Entries, rf.log[i-firstlog])
 		}
 	}
 	res.PreLogIndex = rf.nextIndex[peer] - 1
-	res.PreLogTerm = rf.log[rf.nextIndex[peer]-1].Term
+	res.PreLogTerm = rf.log[res.PreLogIndex-firstlog].Term
 
 	res.LeaderCommit = rf.commitIndex
 
@@ -762,7 +774,7 @@ func (rf *Raft) one_RequestVote(peer int, args *RequestVoteArgs, grantedVote *in
 				rf.currentState = Leader
 				// 成为leader，不需要管election_timeout，这个等下一次变为follower时再更新
 				// 成为leader，要初始化nextIndex[]和matchIndex[]
-				lastlog := len(rf.log) - 1
+				lastlog := rf.getLastLog().LogIndex
 				for peer := range rf.peers {
 					rf.nextIndex[peer] = lastlog + 1
 					rf.matcnIndex[peer] = 0
@@ -784,7 +796,7 @@ func (rf *Raft) begin_heartsbeats() {
 	rf.heartsbeats_timeout = time.Now().UnixMilli() + get_rand_time(100, 0)
 	Debug(dTimer, "S%d Begin heartsbeats", rf.me)
 
-	lastlog := len(rf.log) - 1
+	lastlog := rf.getLastLog().LogIndex
 	validTerm := rf.currentTerm
 	for peer := range rf.peers {
 		if peer == rf.me {
@@ -808,6 +820,7 @@ func (rf *Raft) one_AppendEntries(peer int, args *AppendEntriesArgs, lastlog int
 		//	return
 		//}
 		defer rf.persist()
+		firstlog := rf.getFirstLog().LogIndex
 		if reply.Term > rf.currentTerm {
 			rf.increaseTerm(reply.Term)
 		} else if rf.currentTerm == validTerm && rf.currentTerm == reply.Term && reply.Success {
@@ -824,7 +837,7 @@ func (rf *Raft) one_AppendEntries(peer int, args *AppendEntriesArgs, lastlog int
 			// 检查commitIndex能否更新
 
 			// 这里要判断是否是当前Term的log，否则不予commit
-			if (rf.log[lastlog].Term == rf.currentTerm) && (lastlog > rf.commitIndex) && rf.canIncreaseCommitIndex(lastlog) {
+			if (rf.log[lastlog-firstlog].Term == rf.currentTerm) && (lastlog > rf.commitIndex) && rf.canIncreaseCommitIndex(lastlog) {
 				//fmt.Println("increasing the commitIndex")
 				OldCommitIndex := rf.commitIndex
 				rf.commitIndex = lastlog
@@ -849,11 +862,15 @@ func (rf *Raft) applier() {
 			//fmt.Println("Waiting")
 			rf.applyCond.Wait()
 		}
+
+		// 判断commitIndex小于firstlogIndex?
+
 		//fmt.Println("Ready to commit")
+		firstlog := rf.getFirstLog().LogIndex
 		commitIndex, lastApplied := rf.commitIndex, rf.lastApplied
 		entries := make([]Log, commitIndex-lastApplied)
 		//fmt.Println("commiting ",commitIndex-lastApplied)
-		copy(entries, rf.log[lastApplied+1:commitIndex+1])
+		copy(entries, rf.log[lastApplied+1-firstlog:commitIndex+1-firstlog])
 
 		rf.mu.Unlock()
 		for _, entry := range entries {
@@ -861,7 +878,7 @@ func (rf *Raft) applier() {
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandTerm:  entry.Term,
-				CommandIndex: entry.LogIndex - 1,
+				CommandIndex: entry.LogIndex,
 			}
 		}
 		rf.mu.Lock()
@@ -932,10 +949,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentState = Follower
 	rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300, 150)
 
-	// 每个server填充一个空的log，用以记录snapshotIndex
+	// 每个server填充一个空的log，这个空log为了index计算方便。可以认为是一个空的snapshot
 	empty_log := Log{
 		Term:     0,
-		Command:  -1,
+		Command:  nil,
 		LogIndex: 0,
 	}
 	rf.log = append(rf.log, empty_log)
