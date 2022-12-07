@@ -313,9 +313,26 @@ type AppendEntriesReply struct {
 	IndexNear int  // 用于快速同步nextIndex
 }
 
+func (rf *Raft) getFirstLogIndex() int {
+	return rf.log[0].LogIndex
+}
+
 func (rf *Raft) resetElectionTime() {
 	// 逻辑外已加锁
 	rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300, 150)
+}
+
+func (rf *Raft) increaseTerm(NewTerm int) {
+	// 升Term、重置votedFor、变为Follower
+	Debug(dTerm, "S%d Term update T%d -> T%d", rf.me, rf.currentTerm, NewTerm)
+	rf.currentTerm = NewTerm
+	rf.votedFor = -1
+	if rf.currentState == Leader {
+		Debug(dInfo, "S%d Leader -> Follower at T%d", rf.me, rf.currentTerm)
+	} else if rf.currentState == Candidate {
+		Debug(dInfo, "S%d Canditate -> Follower at T%d", rf.me, rf.currentTerm)
+	}
+	rf.currentState = Follower
 }
 
 func (rf *Raft) isLogUpToDate(LastLogTerm int, LastLogIndex int) bool {
@@ -350,18 +367,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-			// 可以投票
-			// ===================日志判断
-			reply.Term = rf.currentTerm
-			if rf.isLogUpToDate(args.LastLogTerm, args.LastLogIndex) { // 只有grant成功，才更新选举时间
+			if rf.isLogUpToDate(args.LastLogTerm, args.LastLogIndex) {
+				// 投票成功才重置electionTiemout
 				rf.votedFor = args.CandidateId
-				defer rf.resetElectionTime()
+				reply.Term = rf.currentTerm
 				reply.VoteGranted = true
 				Debug(dVote, "S%d Granting Vote to S%d at T%d", rf.me, args.CandidateId, rf.currentTerm)
+				defer rf.resetElectionTime()
 			} else {
+				reply.Term = rf.currentTerm
 				reply.VoteGranted = false
 			}
-
 		} else {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
@@ -369,26 +385,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	} else if args.Term > rf.currentTerm {
 		defer rf.persist()
-		//defer rf.resetElectionTime()
-		// 进入新Term、设置voteFor
-		// 转为Follower
-		// 判断日志，返回True或false
 
-		Debug(dTerm, "S%d Term update T%d -> T%d", rf.me, rf.currentTerm, args.Term)
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		if rf.currentState == Leader || rf.currentState == Candidate {
-			switch rf.currentState {
-			case Leader:
-				Debug(dInfo, "S%d Leader -> Follower at T%d", rf.me, rf.currentTerm)
-			case Candidate:
-				Debug(dInfo, "S%d Candidate -> Follower at T%d", rf.me, rf.currentTerm)
-			}
-			rf.currentState = Follower
-		}
+		rf.increaseTerm(args.Term)
 
-		// ======================日志对比
 		if rf.isLogUpToDate(args.LastLogTerm, args.LastLogIndex) {
+			// 投票成功才重置electionTiemout
 			rf.votedFor = args.CandidateId
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
@@ -517,16 +518,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 进入新Term、设置voteFor、重置选举时间
 		// Follower保持Follower，其他降级为Follower
 
-		Debug(dTerm, "S%d Term update T%d -> T%d", rf.me, rf.currentTerm, args.Term)
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-
-		if rf.currentState == Leader {
-			Debug(dInfo, "S%d Leader -> Follower at T%d", rf.me, rf.currentTerm)
-		} else if rf.currentState == Candidate {
-			Debug(dInfo, "S%d Canditate -> Follower at T%d", rf.me, rf.currentTerm)
-		}
-		rf.currentState = Follower
+		rf.increaseTerm(args.Term)
 
 		// 判断日志，依据返回True和False
 		// ===================日志对比
@@ -781,15 +773,7 @@ func (rf *Raft) one_RequestVote(peer int, args *RequestVoteArgs, grantedVote *in
 				Debug(dLeader, "S%d Achieved Majority for T%d , converting to Leader", rf.me, rf.currentTerm)
 			}
 		} else if response.Term > rf.currentTerm {
-			Debug(dTerm, "S%d Term update T%d -> T%d", rf.me, rf.currentTerm, response.Term)
-			rf.currentTerm = response.Term
-			rf.votedFor = -1
-
-			// 收到更新的Term，降为Follower，更新election_time
-			rf.currentState = Follower
-			//defer rf.resetElectionTime()
-
-			Debug(dInfo, "S%d Candidate -> Follower at T%d", rf.me, rf.currentTerm)
+			rf.increaseTerm(response.Term)
 		}
 	}
 	// 只发送一次，发送失败就算了
@@ -825,13 +809,7 @@ func (rf *Raft) one_AppendEntries(peer int, args *AppendEntriesArgs, lastlog int
 		//}
 		defer rf.persist()
 		if reply.Term > rf.currentTerm {
-			OldTerm := rf.currentTerm
-			rf.currentTerm = reply.Term
-			rf.votedFor = -1
-			rf.currentState = Follower
-			//defer rf.resetElectionTime()
-			Debug(dTerm, "S%d Term update T%d -> T%d", rf.me, OldTerm, rf.currentTerm)
-			Debug(dInfo, "S%d Leader -> Follower at T%d", rf.me, rf.currentTerm)
+			rf.increaseTerm(reply.Term)
 		} else if rf.currentTerm == validTerm && rf.currentTerm == reply.Term && reply.Success {
 			// 同步成功
 			// 写成这样是为了考虑历史RPC的影响，导致matchIndex出现倒退的问题。
@@ -954,16 +932,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentState = Follower
 	rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300, 150)
 
-	// log要填充一个空的log
+	// 每个server填充一个空的log，用以记录snapshotIndex
 	empty_log := Log{
 		Term:     0,
 		Command:  -1,
 		LogIndex: 0,
 	}
 	rf.log = append(rf.log, empty_log)
-	//a := rand.Seed()
 
-	// 初始化调试的日志
+	// 初始化日志参数
 	Init()
 
 	// initialize from state persisted before a crash
@@ -975,6 +952,4 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.applier()
 
 	return rf
-
-	// 这里加一句注释
 }
