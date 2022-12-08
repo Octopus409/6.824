@@ -165,7 +165,7 @@ type Raft struct {
 	lastApplied int
 
 	nextIndex  []int
-	matcnIndex []int
+	matchIndex []int
 
 	currentState        int   // 当前状态
 	election_timeout    int64 // 选举超时时间
@@ -186,6 +186,16 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, isleader
 }
 
+func (rf *Raft) encodeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	return data
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -201,13 +211,7 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveRaftState(rf.encodeState())
 
 	//Debug(dPersist,"S%d Saved State T:%d VF:%d N:%d",rf.me,rf.currentTerm,rf.votedFor,len(rf.log))
 }
@@ -251,8 +255,15 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.lastApplied = log[0].LogIndex
+		rf.commitIndex = log[0].LogIndex
 	}
 	Debug(dPersist, "S%d Starting T:%d VF:%d N:%d", rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
+}
+
+// 消除切片数组的底层引用，允许GC回收
+func (rf *Raft) shrinkEntries(Entries []Log) []Log {
+	return append([]Log{}, Entries...)
 }
 
 //
@@ -272,7 +283,18 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	snapshotIndex := rf.getFirstLog().LogIndex
+	if snapshotIndex >= index {
+		Debug(dSnap, "S%d Rejects the Snapshot as snapshotIndex %d >= index %d", rf.me, snapshotIndex, index)
+		return
+	}
+	rf.log = rf.shrinkEntries(rf.log[index-snapshotIndex:])
+	rf.log[0].Command = nil
+	rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)
+	Debug(dSnap, "S%d Accept the Snapshot %d -> %d", rf.me, snapshotIndex, index)
 }
 
 //
@@ -311,6 +333,20 @@ type AppendEntriesReply struct {
 	Term      int
 	Success   bool // true代表同步成功
 	IndexNear int  // 用于快速同步nextIndex
+}
+
+// InstallSnapShotRPC
+type InstallSnapShotArgs struct {
+	// 不用分片传的方法
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapShotReply struct {
+	Term int
 }
 
 func (rf *Raft) getFirstLog() Log {
@@ -558,6 +594,56 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
+func (rf *Raft) InstallSnapShot(args *InstallSnapShotArgs, reply *InstallSnapShotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.increaseTerm(args.Term)
+		rf.persist()
+	}
+	reply.Term = rf.currentTerm
+	defer rf.resetElectionTime()
+
+	firstlog := rf.getFirstLog().LogIndex
+	lastlog := rf.getLastLog().LogIndex
+	if args.LastIncludedIndex <= rf.commitIndex {
+		// 没有新的日志信息
+		Debug(dSnap, "S%d Rejects the InstallSnapShotRPC from S%d since LastIncludedIndex %d is less than commitIndex %d", rf.me, args.LeaderId, args.LastIncludedIndex, rf.commitIndex)
+		return
+	}
+	if args.LastIncludedIndex >= lastlog {
+		// 清空所有日志，只留记录snapshot的空日志
+		rf.log = rf.shrinkEntries(rf.log[0:1])
+		rf.log[0].LogIndex = args.LastIncludedIndex
+		rf.log[0].Term = args.LastIncludedTerm
+		rf.log[0].Command = nil
+	} else {
+		rf.log = rf.shrinkEntries(rf.log[args.LastIncludedIndex-firstlog:])
+		if rf.log[0].Term != args.LastIncludedTerm {
+			// 日志有冲突，discard LastIncludedIndex 后面所有日志
+			OldLen := len(rf.log)
+			rf.log = rf.shrinkEntries(rf.log[0:1])
+			Debug(dSnap, "S%d Log Contradiction discard %d Logs after index %d", rf.me, OldLen-1, rf.log[0].LogIndex)
+		}
+	}
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  rf.log[0].Term,
+			SnapshotIndex: rf.log[0].LogIndex,
+		}
+	}()
+	OldCommitIndex := rf.commitIndex
+	rf.lastApplied, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
+	rf.persister.SaveStateAndSnapshot(rf.encodeState(), args.Data)
+	Debug(dSnap, "S%d InstallSnapShot CommitIndex %d -> %d datalen %d", rf.me, OldCommitIndex, rf.commitIndex, len(args.Data))
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -609,6 +695,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) sendInstallSnapShot(server int, args *InstallSnapShotArgs, reply *InstallSnapShotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapShot", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -635,7 +726,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.currentState != Leader {
 		return -1, -1, false
 	}
-	index = len(rf.log)
+	index = rf.getLastLog().LogIndex + 1
 	logEntry := Log{
 		Term:     rf.currentTerm,
 		Command:  command,
@@ -731,6 +822,18 @@ func (rf *Raft) genAppendEntriesArgs(peer int) *AppendEntriesArgs {
 	return &res
 }
 
+func (rf *Raft) genInstallSnapShotArgs(peer int) *InstallSnapShotArgs {
+	res := InstallSnapShotArgs{
+		// 不用分片传的方法
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.log[0].LogIndex,
+		LastIncludedTerm:  rf.log[0].Term,
+		Data:              rf.persister.ReadSnapshot(),
+	}
+	return &res
+}
+
 func (rf *Raft) begin_eletion() {
 
 	rf.currentState = Candidate
@@ -770,14 +873,14 @@ func (rf *Raft) one_RequestVote(peer int, args *RequestVoteArgs, grantedVote *in
 			// 对面投票了，说明他的Term小于等于我的
 			*grantedVote++
 			Debug(dVote, "S%d Got Vote <- S%d", rf.me, peer)
-			if *grantedVote > len(rf.peers)/2 {
+			if *grantedVote > len(rf.peers)/2 && rf.currentState != Leader {
 				rf.currentState = Leader
 				// 成为leader，不需要管election_timeout，这个等下一次变为follower时再更新
 				// 成为leader，要初始化nextIndex[]和matchIndex[]
 				lastlog := rf.getLastLog().LogIndex
 				for peer := range rf.peers {
 					rf.nextIndex[peer] = lastlog + 1
-					rf.matcnIndex[peer] = 0
+					rf.matchIndex[peer] = 0
 				}
 
 				// 开启发送心跳报文
@@ -794,23 +897,31 @@ func (rf *Raft) one_RequestVote(peer int, args *RequestVoteArgs, grantedVote *in
 func (rf *Raft) begin_heartsbeats() {
 
 	rf.heartsbeats_timeout = time.Now().UnixMilli() + get_rand_time(100, 0)
-	Debug(dTimer, "S%d Begin heartsbeats", rf.me)
+	Debug(dTimer, "S%d Begin heartsbeats LogLen %d, LastLogIndex %d, SnapShotIndex %d", rf.me, len(rf.log), rf.getLastLog().LogIndex, rf.log[0].LogIndex)
 
+	firstlog := rf.getFirstLog().LogIndex
 	lastlog := rf.getLastLog().LogIndex
 	validTerm := rf.currentTerm
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
-		args := rf.genAppendEntriesArgs(peer)
-		go rf.one_AppendEntries(peer, args, lastlog, validTerm)
+		if rf.nextIndex[peer] > firstlog {
+			// 日志尚在，正常发送
+			args := rf.genAppendEntriesArgs(peer)
+			go rf.one_AppendEntries(peer, args, lastlog, validTerm)
+		} else {
+			// 日志已被压缩，要InstallSnapShotRPC
+			args := rf.genInstallSnapShotArgs(peer)
+			go rf.one_InstallSnapShot(peer, args, validTerm)
+		}
 	}
 
 }
 
 func (rf *Raft) one_AppendEntries(peer int, args *AppendEntriesArgs, lastlog int, validTerm int) {
 	reply := AppendEntriesReply{}
-	Debug(dLog, "S%d -> S%d Sending PLI:%d PLT:%d N:%d LC:%d", rf.me, peer, args.PreLogIndex, args.PreLogTerm, len(args.Entries), args.LeaderCommit)
+	Debug(dLog, "S%d -> S%d Sending AppendEntries PLI:%d PLT:%d N:%d LC:%d", rf.me, peer, args.PreLogIndex, args.PreLogTerm, len(args.Entries), args.LeaderCommit)
 	if rf.sendAppendEntries(peer, args, &reply) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
@@ -829,15 +940,15 @@ func (rf *Raft) one_AppendEntries(peer int, args *AppendEntriesArgs, lastlog int
 			if rf.nextIndex[peer] < lastlog+1 {
 				rf.nextIndex[peer] = lastlog + 1
 			}
-			if rf.matcnIndex[peer] < lastlog {
-				rf.matcnIndex[peer] = lastlog
+			if rf.matchIndex[peer] < lastlog {
+				rf.matchIndex[peer] = lastlog
 			}
-			Debug(dLog, "S%d <- S%d OK Append NI[%d]=%d, MI[%d]=%d", rf.me, peer, peer, rf.nextIndex[peer], peer, rf.matcnIndex[peer])
+			Debug(dLog, "S%d <- S%d OK Append NI[%d]=%d, MI[%d]=%d", rf.me, peer, peer, rf.nextIndex[peer], peer, rf.matchIndex[peer])
 
 			// 检查commitIndex能否更新
 
 			// 这里要判断是否是当前Term的log，否则不予commit
-			if (rf.log[lastlog-firstlog].Term == rf.currentTerm) && (lastlog > rf.commitIndex) && rf.canIncreaseCommitIndex(lastlog) {
+			if (lastlog > rf.commitIndex) && (rf.log[lastlog-firstlog].Term == rf.currentTerm) && rf.canIncreaseCommitIndex(lastlog) {
 				//fmt.Println("increasing the commitIndex")
 				OldCommitIndex := rf.commitIndex
 				rf.commitIndex = lastlog
@@ -851,6 +962,26 @@ func (rf *Raft) one_AppendEntries(peer int, args *AppendEntriesArgs, lastlog int
 		}
 	}
 	// 发送失败同样不处理，等下一次心跳
+}
+
+func (rf *Raft) one_InstallSnapShot(peer int, args *InstallSnapShotArgs, validTerm int) {
+	reply := InstallSnapShotReply{}
+	Debug(dSnap, "S%d -> S%d Sending InstallSnapShot LII:%d LIT:%d dataLen:%d", rf.me, peer, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data))
+	if rf.sendInstallSnapShot(peer, args, &reply) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		defer rf.persist()
+		if reply.Term > rf.currentTerm {
+			rf.increaseTerm(reply.Term)
+			return
+		}
+		if rf.currentTerm == validTerm {
+			// install successfully
+			rf.nextIndex[peer] = max(rf.nextIndex[peer], args.LastIncludedIndex+1)
+			rf.matchIndex[peer] = max(rf.matchIndex[peer], args.LastIncludedIndex)
+			Debug(dSnap, "S%d <- S%d OK Snapshot NI[%d]=%d, MI[%d]=%d", rf.me, peer, peer, rf.nextIndex[peer], peer, rf.matchIndex[peer])
+		}
+	}
 }
 
 // applier的后台协程，只有一个
@@ -898,7 +1029,7 @@ func (rf *Raft) canIncreaseCommitIndex(index int) bool {
 		if peer == rf.me {
 			continue
 		}
-		if rf.matcnIndex[peer] >= index {
+		if rf.matchIndex[peer] >= index {
 			sum++
 		}
 	}
@@ -944,7 +1075,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 
 	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matcnIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.currentState = Follower
 	rf.election_timeout = time.Now().UnixMilli() + get_rand_time(300, 150)

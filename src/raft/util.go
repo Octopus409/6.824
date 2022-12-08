@@ -5,7 +5,7 @@ import "log"
 // Debugging
 const debug = true
 
-func initLog(){
+func initLog() {
 	log.SetFlags(log.Lmicroseconds)
 }
 
