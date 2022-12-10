@@ -71,8 +71,13 @@ const (
 
 var debugStart time.Time
 var debugVerbosity int
+var alreadyInit bool // 是否首次初始化日志参数，全局变量默认为false
 
 func Init() {
+	if alreadyInit {
+		return
+	}
+	alreadyInit = true
 	debugVerbosity = getVerbosity()
 	debugStart = time.Now()
 
@@ -677,15 +682,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	// RequestVote函数，保证必定返回。
 	// 如果rpc成功，有返回值，  True
 	// 如果rpc在一定时间内没有反应， False
-
-	//rf.mu.Lock()
-
-	/*   不管发送前，状态有没有变化，好像还是发送比较好。
-	if rf.currentState == Follower || rf.currentState==Leader {
-		rf.mu.Unlock()
-		return false
-	}
-	*/
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -886,6 +882,7 @@ func (rf *Raft) one_RequestVote(peer int, args *RequestVoteArgs, grantedVote *in
 				// 开启发送心跳报文
 				rf.heartsbeats_timeout = time.Now().UnixMilli()
 				Debug(dLeader, "S%d Achieved Majority for T%d , converting to Leader", rf.me, rf.currentTerm)
+				//rf.begin_heartsbeats()
 			}
 		} else if response.Term > rf.currentTerm {
 			rf.increaseTerm(response.Term)
